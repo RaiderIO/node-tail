@@ -210,6 +210,19 @@ class Tail extends events.EventEmitter {
             const block = this.queue[0];
             if (block.end > block.start) {
                 let stream = fs.createReadStream(this.filename, { start: block.start, end: block.end - 1, encoding: this.encoding });
+
+                // If this.buffer has a partial line carried over from the previous block,
+                // its start offset is block.start minus those buffered bytes.
+                let lineStartOffset = block.start - Buffer.byteLength(this.buffer);
+
+                // Build a capturing-group version of the separator so we can measure
+                // exact separator byte lengths and advance lineStartOffset accurately.
+                const capturingSep = this.separator instanceof RegExp
+                  ? new RegExp(`(${this.separator.source})`, this.separator.flags.replace('g', ''))
+                  : this.separator !== null
+                    ? new RegExp(`(${this.separator.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`)
+                    : null;
+
                 stream.on('error', (error) => {
                     this.logger.error(`Tail error: ${error}`);
                     this.emit('error', error);
@@ -220,19 +233,30 @@ class Tail extends events.EventEmitter {
                         this.internalDispatcher.emit('next');
                     }
                     if (this.flushAtEOF && this.buffer.length > 0) {
-                        this.emit('line', this.buffer);
+                        const startOffset = lineStartOffset;
+                        const endOffset = startOffset + Buffer.byteLength(this.buffer);
+                        this.emit('line', this.buffer, { startOffset, endOffset });
                         this.buffer = "";
                     }
                 });
                 stream.on('data', (d) => {
                     if (this.separator === null) {
-                        this.emit("line", d);
+                        const startOffset = lineStartOffset;
+                        const endOffset = startOffset + Buffer.byteLength(d);
+                        lineStartOffset = endOffset;
+                        this.emit('line', d, { startOffset, endOffset });
                     } else {
                         this.buffer += d;
-                        let parts = this.buffer.split(this.separator);
-                        this.buffer = parts.pop();
-                        for (const chunk of parts) {
-                            this.emit("line", chunk);
+                        const rawParts = this.buffer.split(capturingSep);
+                        this.buffer = rawParts[rawParts.length - 1];
+                        for (let i = 0; i < rawParts.length - 1; i += 2) {
+                            const chunk = rawParts[i];
+                            const sep = rawParts[i + 1];
+
+                            const startOffset = lineStartOffset;
+                            const endOffset = startOffset + Buffer.byteLength(chunk);
+                            this.emit('line', chunk, { startOffset, endOffset });
+                            lineStartOffset = endOffset + Buffer.byteLength(sep);
                         }
                     }
                 });
