@@ -42,6 +42,11 @@ class Tail extends events.EventEmitter {
         this.queue = [];
         this.isWatching = false;
         this.pos = 0;
+        this.activeStream = null;
+        // Incremented whenever we reset on shrink/truncation. Each read stream captures
+        // the current generation so stale async callbacks from the pre-reset file state
+        // can be ignored instead of mutating buffer/queue with old bytes.
+        this.readGeneration = 0;
 
         // this.internalDispatcher.on('next',this.readBlock);
         this.internalDispatcher.on('next', () => {
@@ -205,15 +210,37 @@ class Tail extends events.EventEmitter {
         }
     }
 
+    resetState(cursorPosition) {
+        // Once the file size moves backward, any carried partial buffer and queued
+        // reads are no longer trustworthy. Drop them so stale bytes cannot be
+        // prepended to freshly written content after truncation or rewrite.
+        this.logger.info(`Resetting tail state for ${this.filename} at cursor ${cursorPosition}`);
+        this.buffer = '';
+        this.queue = [];
+        this.currentCursorPos = cursorPosition;
+        // Invalidate any in-flight readBlock() streams. They may still emit 'data'/'end'
+        // after we destroy them, so their handlers must be able to detect they belong to
+        // the old file state and ignore those callbacks.
+        this.readGeneration++;
+        if (this.activeStream) {
+            this.activeStream.destroy();
+            this.activeStream = null;
+        }
+    }
+
     readBlock() {
         if (this.queue.length >= 1) {
             const block = this.queue[0];
             if (block.end > block.start) {
+                // Snapshot the file-state epoch for this stream. If resetState() runs while
+                // this read is in flight, later callbacks from this stream must be ignored.
+                const readGeneration = this.readGeneration;
                 let stream = fs.createReadStream(this.filename, { start: block.start, end: block.end - 1, encoding: this.encoding });
+                this.activeStream = stream;
 
                 // If this.buffer has a partial line carried over from the previous block,
                 // its start offset is block.start minus those buffered bytes.
-                let lineStartOffset = block.start - Buffer.byteLength(this.buffer);
+                let lineStartOffset = Math.max(0, block.start - Buffer.byteLength(this.buffer));
 
                 // Build a capturing-group version of the separator so we can measure
                 // exact separator byte lengths and advance lineStartOffset accurately.
@@ -223,11 +250,33 @@ class Tail extends events.EventEmitter {
                     ? new RegExp(`(${this.separator.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`)
                     : null;
 
+                const clearActiveStream = () => {
+                    if (this.activeStream === stream) {
+                        this.activeStream = null;
+                    }
+                };
+
                 stream.on('error', (error) => {
+                    clearActiveStream();
+                    // resetState() destroys the stale stream on purpose; do not surface that
+                    // expected teardown as a real tail error.
+                    if (readGeneration !== this.readGeneration && error && error.code === 'ERR_STREAM_DESTROYED') {
+                        return;
+                    }
                     this.logger.error(`Tail error: ${error}`);
                     this.emit('error', error);
                 });
+                stream.on('close', () => {
+                    clearActiveStream();
+                });
                 stream.on('end', () => {
+                    clearActiveStream();
+                    // A stale stream can still finish after resetState(). Its queue/buffer
+                    // bookkeeping belongs to the previous file state and must not run now.
+                    if (readGeneration !== this.readGeneration) {
+                        return;
+                    }
+
                     let _ = this.queue.shift();
                     if (this.queue.length > 0) {
                         this.internalDispatcher.emit('next');
@@ -240,6 +289,11 @@ class Tail extends events.EventEmitter {
                     }
                 });
                 stream.on('data', (d) => {
+                    // Ignore bytes from any stream that started before the most recent reset.
+                    if (readGeneration !== this.readGeneration) {
+                        return;
+                    }
+
                     if (this.separator === null) {
                         const startOffset = lineStartOffset;
                         const endOffset = startOffset + Buffer.byteLength(d);
@@ -267,7 +321,7 @@ class Tail extends events.EventEmitter {
     change() {
         let p = this.latestPosition()
         if (p < this.currentCursorPos) {//scenario where text is not appended but it's actually a w+
-            this.currentCursorPos = p
+            this.resetState(p)
         } else if (p > this.currentCursorPos) {
             this.queue.push({ start: this.currentCursorPos, end: p });
             this.currentCursorPos = p
@@ -340,9 +394,12 @@ class Tail extends events.EventEmitter {
     }
 
     watchFileEvent(curr, prev) {
-        if (curr.size > prev.size) {
+        if (curr.size < prev.size || curr.size < this.currentCursorPos) {
+            this.resetState(curr.size);
+        } else if (curr.size > this.currentCursorPos) {
+            const start = this.currentCursorPos;
             this.currentCursorPos = curr.size;    //Update this.currentCursorPos so that a consumer can determine if entire file has been handled
-            this.queue.push({ start: prev.size, end: curr.size });
+            this.queue.push({ start, end: curr.size });
             if (this.queue.length == 1) {
                 this.internalDispatcher.emit("next");
             }

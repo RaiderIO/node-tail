@@ -304,4 +304,74 @@ describe('Tail', function () {
         fs.unlinkSync(fileToTest);
     }, 2000);
 });
+
+    describe('truncate/reset handling', () => {
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        it('should discard buffered partial content after shrink via change()', async function () {
+            this.timeout(5000);
+            const tailedFile = new Tail(fileToTest, { fromBeginning: true, fsWatchOptions: { interval: 100 } });
+            const lines = [];
+
+            tailedFile.on('line', function (line, offsets) {
+                lines.push({ line, offsets });
+            });
+
+            fs.appendFileSync(fileToTest, 'Player-10');
+            tailedFile.change();
+            await wait(50);
+
+            fs.truncateSync(fileToTest, 0);
+            tailedFile.change();
+            await wait(50);
+
+            const nextLine = '3/24/2026 06:17:45.7751 SPELL_DAMAGE';
+            fs.appendFileSync(fileToTest, `${nextLine}\n`);
+            tailedFile.change();
+            await wait(100);
+
+            tailedFile.unwatch();
+
+            expect(lines).to.deep.equal([
+                {
+                    line: nextLine,
+                    offsets: { startOffset: 0, endOffset: Buffer.byteLength(nextLine) }
+                }
+            ]);
+        });
+
+        it('should discard buffered partial content after shrink via watchFileEvent()', async function () {
+            this.timeout(5000);
+            const tailedFile = new Tail(fileToTest, { fromBeginning: true, useWatchFile: true, fsWatchOptions: { interval: 100 } });
+            const lines = [];
+            fs.unwatchFile(fileToTest);
+
+            tailedFile.on('line', function (line, offsets) {
+                lines.push({ line, offsets });
+            });
+
+            fs.appendFileSync(fileToTest, 'Player-10');
+            tailedFile.watchFileEvent({ size: 9 }, { size: 0 });
+            await wait(100);
+
+            fs.truncateSync(fileToTest, 0);
+            tailedFile.watchFileEvent({ size: 0 }, { size: 9 });
+            await wait(100);
+
+            const nextLine = '3/24/2026 06:17:45.7751 SPELL_DAMAGE';
+            fs.appendFileSync(fileToTest, `${nextLine}\n`);
+            tailedFile.watchFileEvent({ size: Buffer.byteLength(`${nextLine}\n`) }, { size: 0 });
+            await wait(200);
+
+            tailedFile.unwatch();
+
+            expect(lines).to.deep.equal([
+                {
+                    line: nextLine,
+                    offsets: { startOffset: 0, endOffset: Buffer.byteLength(nextLine) }
+                }
+            ]);
+        });
+
+    });
 });
